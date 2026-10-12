@@ -22,8 +22,9 @@ import {SnitchTypes} from "./SnitchTypes.sol";
 ///
 /// The owner (the launch owner, two-step, cannot renounce) sets the case fee for future cases and
 /// the protocol-facing values the oracle skill wants movable without a redeploy: intake, action id,
-/// signer, panel size and quorum, and the failure hook. No pause, no upgrade, and no way to move
-/// held SNITCH except the burn and the refund.
+/// signer, panel size and quorum, and the failure hook. Each setting binds cases opened after it:
+/// an open case is answered only by the intake it was asked at, with the panel it asked for. No
+/// pause, no upgrade, and no way to move held SNITCH except the burn and the refund.
 contract SnitchDesk is OracleAttestationConsumer, Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using Strings for uint256;
@@ -36,6 +37,10 @@ contract SnitchDesk is OracleAttestationConsumer, Ownable2Step, ReentrancyGuard 
     error BadBlockRange(uint64 fromBlock, uint64 toBlock);
     error NotTheIntake();
     error UnknownRequest(bytes32 requestId);
+    error DuplicateRequestId(bytes32 requestId);
+    error WrongWindow(uint64 fromBlock, uint64 toBlock);
+    error FeeAboveLimit(uint256 fee, uint256 maxFee);
+    error PriceAboveLimit(uint256 price, uint256 maxOraclePrice);
     error NotOpen(uint256 caseId);
     error NotAnswered(uint256 caseId);
     error NotTheOpener(uint256 caseId);
@@ -121,6 +126,9 @@ contract SnitchDesk is OracleAttestationConsumer, Ownable2Step, ReentrancyGuard 
     mapping(uint256 caseId => SnitchTypes.Case) internal cases;
     /// @notice The intake's request id to the case it belongs to.
     mapping(bytes32 requestId => uint256 caseId) public caseOfRequest;
+    /// @notice The intake each request was asked at. Only that intake may answer or fail it, so
+    /// moving the desk with `setIntake` never strands a case that is already open.
+    mapping(bytes32 requestId => address intake) public intakeOfRequest;
     /// @notice Set when the intake reported that the oracle refused or could not answer the case.
     mapping(uint256 caseId => bool) public failed;
 
@@ -155,6 +163,8 @@ contract SnitchDesk is OracleAttestationConsumer, Ownable2Step, ReentrancyGuard 
 
     /// @notice Opens a case. Pulls the case fee in SNITCH and the oracle price in IMD from the
     /// caller (both must be approved), forwards the IMD to the intake and asks the question.
+    /// Pays whatever the fee and the intake's price are when the transaction lands: approve
+    /// exactly `caseFee()` and `oraclePrice()`, or use `openCaseWithLimits` to cap both.
     /// @param kind 0 "never sold", 1 "got in early"
     /// @param token the ERC-20 the claim is about; must have code
     /// @param wallet the wallet the claim is about
@@ -163,6 +173,31 @@ contract SnitchDesk is OracleAttestationConsumer, Ownable2Step, ReentrancyGuard 
     function openCase(uint8 kind, address token, address wallet, uint64 fromBlock, uint64 toBlock)
         external
         nonReentrant
+        returns (uint256 caseId)
+    {
+        return _open(kind, token, wallet, fromBlock, toBlock);
+    }
+
+    /// @notice `openCase` with the amounts the opener agreed to: reverts instead of paying more
+    /// than `maxFee` SNITCH or `maxOraclePrice` IMD, for wallets that hold a standing approval.
+    /// Both are read here and pulled in the same transaction, so neither can move in between.
+    function openCaseWithLimits(
+        uint8 kind,
+        address token,
+        address wallet,
+        uint64 fromBlock,
+        uint64 toBlock,
+        uint256 maxFee,
+        uint256 maxOraclePrice
+    ) external nonReentrant returns (uint256 caseId) {
+        if (caseFee > maxFee) revert FeeAboveLimit(caseFee, maxFee);
+        uint256 price = intake.priceOf(action, address(imd));
+        if (price > maxOraclePrice) revert PriceAboveLimit(price, maxOraclePrice);
+        return _open(kind, token, wallet, fromBlock, toBlock);
+    }
+
+    function _open(uint8 kind, address token, address wallet, uint64 fromBlock, uint64 toBlock)
+        internal
         returns (uint256 caseId)
     {
         if (kind > SnitchTypes.KIND_GOT_IN_EARLY) revert BadKind(kind);
@@ -194,10 +229,14 @@ contract SnitchDesk is OracleAttestationConsumer, Ownable2Step, ReentrancyGuard 
             imd.forceApprove(address(intake), price);
         }
         // The intake's request id is only known after the call. Everything else about the case is
-        // already stored, the function is guarded, and the id is bound here and in the event.
+        // already stored, the function is guarded, and the id is bound here and in the event. The
+        // id must be new: the binding below is what lets only the asked intake answer the case.
         bytes32 requestId = _ask(body(kind, token, wallet, fromBlock, toBlock), price);
+        if (caseOfRequest[requestId] != 0) revert DuplicateRequestId(requestId);
         // slither-disable-next-line reentrancy-benign
         caseOfRequest[requestId] = caseId;
+        // slither-disable-next-line reentrancy-benign
+        intakeOfRequest[requestId] = address(intake);
 
         emit CaseOpened(caseId, msg.sender, kind, token, wallet, fromBlock, toBlock, symbol, fee, price, requestId);
     }
@@ -231,19 +270,22 @@ contract SnitchDesk is OracleAttestationConsumer, Ownable2Step, ReentrancyGuard 
 
     // ---- the intake ----
 
-    /// @notice The oracle's answer. Only the intake calls it, only for an open case of this desk,
-    /// only with an attestation the oracle signer signed for this desk. A failed check reverts and
-    /// stores nothing. A valid answer stores verdict, figure, panel and date, and burns the fee.
+    /// @notice The oracle's answer. Only the intake the case was asked at calls it, only for an
+    /// open case of this desk, only with an attestation over the case's own block window that the
+    /// oracle signer signed for this desk. A failed check reverts and stores nothing. A valid
+    /// answer stores verdict, figure, panel and date, and burns the fee.
     function onOracleResult(bytes32 requestId, OracleAttestation.Attestation calldata a, bytes calldata signature)
         external
         nonReentrant
     {
-        if (msg.sender != address(intake)) revert NotTheIntake();
         uint256 caseId = caseOfRequest[requestId];
         if (caseId == 0) revert UnknownRequest(requestId);
+        if (msg.sender != intakeOfRequest[requestId]) revert NotTheIntake();
         SnitchTypes.Case storage c = cases[caseId];
         if (c.status != SnitchTypes.Status.Open) revert NotOpen(caseId);
         if (a.chainId != block.chainid) revert WrongChain(a.chainId);
+        // The window is absolute and confirmed when asked, so the signed one must be the case's.
+        if (a.fromBlock != c.fromBlock || a.toBlock != c.toBlock) revert WrongWindow(a.fromBlock, a.toBlock);
         if (a.panelSize < c.askedPanelSize || a.quorum < c.askedQuorum || a.agreed < a.quorum) {
             revert PanelTooWeak(a.panelSize, a.quorum, a.agreed);
         }
@@ -274,9 +316,9 @@ contract SnitchDesk is OracleAttestationConsumer, Ownable2Step, ReentrancyGuard 
         uint16 answered,
         bytes calldata
     ) external {
-        if (msg.sender != address(intake)) revert NotTheIntake();
         uint256 caseId = caseOfRequest[requestId];
         if (caseId == 0) revert UnknownRequest(requestId);
+        if (msg.sender != intakeOfRequest[requestId]) revert NotTheIntake();
         // slither-disable-next-line timestamp
         if (cases[caseId].status != SnitchTypes.Status.Open) revert NotOpen(caseId);
         failed[caseId] = true;
@@ -293,7 +335,8 @@ contract SnitchDesk is OracleAttestationConsumer, Ownable2Step, ReentrancyGuard 
         emit CaseFeeSet(fee);
     }
 
-    /// @notice Moves the desk to another intake (a new version, or a moved deployment).
+    /// @notice Moves the desk to another intake (a new version, or a moved deployment) for cases
+    /// opened from now on. Open cases stay bound to the intake they were asked at.
     function setIntake(address to) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
         intake = IIntake(to);
@@ -306,7 +349,9 @@ contract SnitchDesk is OracleAttestationConsumer, Ownable2Step, ReentrancyGuard 
         emit ActionSet(to);
     }
 
-    /// @notice Rotates the oracle signer, or points it at a signer registry.
+    /// @notice Rotates the oracle signer, or points it at a signer registry. Open cases are
+    /// checked against the signer in force when the answer lands, so during a handover point this
+    /// at an ERC-1271 registry that accepts both keys, or rotate while no case is open.
     function setOracleSigner(address to) external onlyOwner {
         _setOracleSigner(to);
     }

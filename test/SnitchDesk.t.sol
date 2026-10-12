@@ -14,6 +14,7 @@ import {
     MockERC20,
     RevertingSymbolToken
 } from "./mocks/MockERC20.sol";
+import {MockIntake} from "./mocks/MockIntake.sol";
 
 contract SnitchDeskTest is SnitchBase {
     // ---- construction ----
@@ -183,6 +184,47 @@ contract SnitchDeskTest is SnitchBase {
         desk.openCase(0, address(pepe), wallet, 1, 2);
     }
 
+    function test_openCaseWithLimitsRefusesAFeeOrPriceAboveTheLimit() public {
+        // the opener was quoted 200,000 SNITCH + 0.5 IMD and holds an unlimited approval
+        vm.prank(OWNER);
+        desk.setCaseFee(2_000_000 ether);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(SnitchDesk.FeeAboveLimit.selector, 2_000_000 ether, FEE));
+        desk.openCaseWithLimits(0, address(pepe), wallet, 21_004_118, 21_077_903, FEE, PRICE);
+
+        vm.prank(OWNER);
+        desk.setCaseFee(FEE);
+        intake.setPrice(desk.DEFAULT_ACTION(), address(imd), 5 ether);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(SnitchDesk.PriceAboveLimit.selector, 5 ether, PRICE));
+        desk.openCaseWithLimits(0, address(pepe), wallet, 21_004_118, 21_077_903, FEE, PRICE);
+        assertEq(desk.caseCount(), 0, "nothing opened, nothing pulled");
+        assertEq(snitch.balanceOf(alice), 10 * FEE);
+        assertEq(imd.balanceOf(alice), 10 * PRICE);
+
+        // exactly the quoted amounts are accepted, and the case is the same as openCase's
+        intake.setPrice(desk.DEFAULT_ACTION(), address(imd), PRICE);
+        vm.prank(alice);
+        uint256 caseId = desk.openCaseWithLimits(0, address(pepe), wallet, 21_004_118, 21_077_903, FEE, PRICE);
+        assertEq(caseId, 1);
+        assertEq(desk.getCase(1).fee, FEE);
+        assertEq(snitch.balanceOf(alice), 10 * FEE - FEE);
+        assertEq(imd.balanceOf(alice), 10 * PRICE - PRICE);
+        assertEq(desk.caseOfRequest(requestOf(1)), 1);
+        assertEq(desk.intakeOfRequest(requestOf(1)), address(intake));
+        assertTrue(answer(1, true, 0));
+    }
+
+    function test_openCaseRefusesARequestIdAlreadyBound() public {
+        open(alice, 0);
+        // the intake hands out an id it already gave this desk
+        intake.setCount(0);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(SnitchDesk.DuplicateRequestId.selector, requestOf(1)));
+        desk.openCase(0, address(pepe), wallet, 1, 2);
+        assertEq(desk.caseOfRequest(requestOf(1)), 1, "the first case keeps its binding");
+    }
+
     function test_caseNumbersStartAtOneAndCount() public {
         assertEq(open(alice, 0), 1);
         assertEq(open(bob, 1), 2);
@@ -314,6 +356,115 @@ contract SnitchDeskTest is SnitchBase {
         vm.prank(address(intake));
         vm.expectRevert(abi.encodeWithSelector(SnitchDesk.UnknownRequest.selector, bytes32(uint256(99))));
         desk.onOracleResult(bytes32(uint256(99)), a, sig);
+    }
+
+    // ---- the intake a case was asked at ----
+
+    function test_openCaseBindsTheIntakeItAskedAt() public {
+        uint256 caseId = open(alice, 0);
+        assertEq(desk.intakeOfRequest(requestOf(caseId)), address(intake));
+        assertEq(desk.intakeOfRequest(bytes32(uint256(99))), address(0));
+    }
+
+    function test_answerFromTheAskedIntakeLandsAfterSetIntake() public {
+        MockIntake other = new MockIntake();
+        other.setCount(100); // ids that do not collide with the first intake's
+        other.setPrice(desk.DEFAULT_ACTION(), address(imd), PRICE);
+
+        uint256 caseId = open(alice, 0);
+        vm.prank(OWNER);
+        desk.setIntake(address(other));
+
+        // the new intake is not the one the case was asked at
+        OracleAttestation.Attestation memory a = attestationFor(caseId, true, 0);
+        bytes memory sig = sign(a);
+        vm.prank(address(other));
+        vm.expectRevert(SnitchDesk.NotTheIntake.selector);
+        desk.onOracleResult(requestOf(caseId), a, sig);
+
+        // the old intake's writer lands the answer under the stipend
+        (bool ok,) = intake.complete(requestOf(caseId), a, sig);
+        assertTrue(ok, "the intake the case was asked at must be able to answer it");
+        assertEq(uint8(desk.getCase(caseId).status), uint8(SnitchTypes.Status.Answered));
+        assertEq(snitch.balanceOf(desk.BURN()), FEE);
+
+        // a case opened after the move is asked at, and answered by, the new intake only
+        uint256 later = open(bob, 1);
+        bytes32 laterId = keccak256(abi.encode("intake", 101));
+        assertEq(desk.caseOfRequest(laterId), later);
+        assertEq(desk.intakeOfRequest(laterId), address(other));
+        assertEq(imd.balanceOf(address(other)), PRICE);
+        OracleAttestation.Attestation memory b = attestationFor(later, false, 1);
+        bytes memory sigB = sign(b);
+        vm.prank(address(intake));
+        vm.expectRevert(SnitchDesk.NotTheIntake.selector);
+        desk.onOracleResult(laterId, b, sigB);
+        (ok,) = other.complete(laterId, b, sigB);
+        assertTrue(ok);
+        assertFalse(desk.getCase(later).verdict);
+    }
+
+    function test_failureFromTheAskedIntakeLandsAfterSetIntake() public {
+        vm.prank(OWNER);
+        desk.setFailureHook(true);
+        MockIntake other = new MockIntake();
+        other.setCount(100);
+        other.setPrice(desk.DEFAULT_ACTION(), address(imd), PRICE);
+
+        uint256 caseId = open(alice, 0);
+        vm.prank(OWNER);
+        desk.setIntake(address(other));
+
+        vm.prank(address(other));
+        vm.expectRevert(SnitchDesk.NotTheIntake.selector);
+        desk.onOracleFailure(requestOf(caseId), 2, bytes32("disagreed"), 3, 12, "");
+        assertFalse(desk.failed(caseId));
+
+        assertTrue(intake.fail(requestOf(caseId), 2, bytes32("disagreed"), 3, 12));
+        assertTrue(desk.failed(caseId));
+        uint256 before = snitch.balanceOf(alice);
+        vm.prank(alice);
+        desk.dropCase(caseId);
+        assertEq(snitch.balanceOf(alice), before + FEE);
+    }
+
+    function test_ownerCannotStampAnOpenCaseThroughTheSetters() public {
+        uint256 caseId = open(alice, 0);
+        uint256 ownerKey = 0xA11CE;
+        vm.startPrank(OWNER);
+        desk.setOracleSigner(vm.addr(ownerKey));
+        desk.setIntake(OWNER);
+        OracleAttestation.Attestation memory a = attestationFor(caseId, false, 123);
+        bytes memory sig = signWith(ownerKey, a);
+        vm.expectRevert(SnitchDesk.NotTheIntake.selector);
+        desk.onOracleResult(requestOf(caseId), a, sig);
+        vm.expectRevert(SnitchDesk.NotTheIntake.selector);
+        desk.onOracleFailure(requestOf(caseId), 1, bytes32("body_invalid"), 0, 0, "");
+        vm.stopPrank();
+        assertEq(uint8(desk.getCase(caseId).status), uint8(SnitchTypes.Status.Open));
+        assertFalse(desk.failed(caseId));
+        assertEq(snitch.balanceOf(address(desk)), FEE);
+    }
+
+    function test_answerForAnotherWindowReverts() public {
+        uint256 caseId = open(alice, 0);
+        OracleAttestation.Attestation memory a = attestationFor(caseId, true, 0);
+        a.fromBlock = 1;
+        a.toBlock = 2;
+        a.questionHash = keccak256("something else");
+        expectDeliveryRevert(caseId, a, abi.encodeWithSelector(SnitchDesk.WrongWindow.selector, 1, 2));
+
+        a = attestationFor(caseId, true, 0);
+        a.toBlock = a.toBlock + 1;
+        expectDeliveryRevert(caseId, a, abi.encodeWithSelector(SnitchDesk.WrongWindow.selector, a.fromBlock, a.toBlock));
+
+        a = attestationFor(caseId, true, 0);
+        a.fromBlock = a.fromBlock - 1;
+        expectDeliveryRevert(caseId, a, abi.encodeWithSelector(SnitchDesk.WrongWindow.selector, a.fromBlock, a.toBlock));
+
+        assertEq(uint8(desk.getCase(caseId).status), uint8(SnitchTypes.Status.Open), "nothing stored");
+        assertEq(snitch.balanceOf(address(desk)), FEE, "nothing burned");
+        assertTrue(answer(caseId, true, 0), "the case's own window lands");
     }
 
     function test_callbackForSettledCaseReverts() public {
