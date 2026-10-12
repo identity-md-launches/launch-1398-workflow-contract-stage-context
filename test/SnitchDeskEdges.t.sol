@@ -71,27 +71,41 @@ contract SnitchDeskEdgesTest is SnitchBase {
 
     // ---- the intake ----
 
-    function test_movingTheIntakeStrandsOpenCasesUntilTheyCanBeDropped() public {
+    /// @dev Moving the desk to another intake does not strand a case in flight: the case stays
+    /// bound to the intake it was asked at, which is the only one that can answer or fail it, and
+    /// the new intake can neither answer the old case nor be answered by the old intake.
+    function test_movingTheIntakeKeepsOpenCasesWithTheIntakeTheyWereAskedAt() public {
         uint256 caseId = open(alice, 0);
         MockIntake other = new MockIntake();
+        other.setCount(1_000); // ids that do not collide with the first intake's
         vm.prank(OWNER);
         desk.setIntake(address(other));
+        assertEq(desk.intakeOfRequest(requestOf(caseId)), address(intake), "the binding moved with the setting");
 
-        // the old intake's writer can no longer land the answer
+        // the new intake cannot answer or fail the case it did not sell
         OracleAttestation.Attestation memory a = attestationFor(caseId, true, 0);
-        expectDeliveryRevert(caseId, a, abi.encodeWithSelector(SnitchDesk.NotTheIntake.selector));
-        assertEq(snitch.balanceOf(address(desk)), FEE);
+        bytes memory sig = sign(a);
+        vm.prank(address(other));
+        vm.expectRevert(SnitchDesk.NotTheIntake.selector);
+        desk.onOracleResult(requestOf(caseId), a, sig);
+        vm.prank(address(other));
+        vm.expectRevert(SnitchDesk.NotTheIntake.selector);
+        desk.onOracleFailure(requestOf(caseId), 2, bytes32("disagreed"), 3, 12, "");
+        assertFalse(desk.failed(caseId));
 
-        // the opener waits the full delay, then gets the SNITCH back; the IMD is with the old intake
+        // the case is still waiting, not stranded: the opener cannot drop it early
         vm.prank(alice);
         vm.expectRevert(
             abi.encodeWithSelector(SnitchDesk.TooEarly.selector, caseId, uint64(block.timestamp) + 72 hours)
         );
         desk.dropCase(caseId);
-        vm.warp(block.timestamp + 72 hours);
-        vm.prank(alice);
-        desk.dropCase(caseId);
+
+        // the old intake's writer lands the answer under the stipend and the fee burns
+        (bool ok,) = intake.complete(requestOf(caseId), a, sig);
+        assertTrue(ok, "the intake the case was asked at could not answer it");
+        assertEq(uint8(desk.getCase(caseId).status), uint8(SnitchTypes.Status.Answered));
         assertEq(snitch.balanceOf(address(desk)), 0);
+        assertEq(snitch.balanceOf(desk.BURN()), FEE);
         assertEq(imd.balanceOf(address(intake)), PRICE);
 
         // new cases need the new intake to sell the action
@@ -100,8 +114,75 @@ contract SnitchDeskEdgesTest is SnitchBase {
         desk.openCase(0, address(pepe), wallet, 1, 2);
         other.setPrice(desk.DEFAULT_ACTION(), address(imd), 1 ether);
         assertEq(desk.oraclePrice(), 1 ether);
-        open(alice, 0);
+        uint256 later = open(alice, 0);
+        bytes32 laterId = keccak256(abi.encode("intake", 1_001));
+        assertEq(desk.caseOfRequest(laterId), later);
+        assertEq(desk.intakeOfRequest(laterId), address(other));
         assertEq(imd.balanceOf(address(other)), 1 ether);
+
+        // and the old intake cannot answer the case the new one sold
+        OracleAttestation.Attestation memory b = attestationFor(later, false, 9);
+        bytes memory sigB = sign(b);
+        vm.prank(address(intake));
+        vm.expectRevert(SnitchDesk.NotTheIntake.selector);
+        desk.onOracleResult(laterId, b, sigB);
+        (ok,) = other.complete(laterId, b, sigB);
+        assertTrue(ok);
+        assertEq(snitch.balanceOf(desk.BURN()), 2 * FEE);
+    }
+
+    /// @dev An intake move never touches the refund path: an old case the old intake never
+    /// answers is still dropped after the delay, and the IMD stays with the intake that was paid.
+    function test_movingTheIntakeDoesNotBlockDroppingAnUnansweredCase() public {
+        uint256 caseId = open(alice, 0);
+        MockIntake other = new MockIntake();
+        other.setCount(1_000);
+        other.setPrice(desk.DEFAULT_ACTION(), address(imd), PRICE);
+        vm.prank(OWNER);
+        desk.setIntake(address(other));
+        uint256 later = open(bob, 1);
+
+        vm.warp(block.timestamp + 72 hours);
+        vm.prank(alice);
+        desk.dropCase(caseId);
+        vm.prank(bob);
+        desk.dropCase(later);
+        assertEq(snitch.balanceOf(address(desk)), 0);
+        assertEq(snitch.balanceOf(alice), 10 * FEE);
+        assertEq(snitch.balanceOf(bob), 10 * FEE);
+        assertEq(imd.balanceOf(address(intake)), PRICE, "the IMD is never refunded");
+        assertEq(imd.balanceOf(address(other)), PRICE);
+
+        // neither intake can revive a dropped case
+        OracleAttestation.Attestation memory a = attestationFor(caseId, true, 0);
+        expectDeliveryRevert(caseId, a, abi.encodeWithSelector(SnitchDesk.NotOpen.selector, caseId));
+        OracleAttestation.Attestation memory b = attestationFor(later, true, 0);
+        bytes memory sigB = sign(b);
+        bytes32 laterId = keccak256(abi.encode("intake", 1_001));
+        vm.prank(address(other));
+        vm.expectRevert(abi.encodeWithSelector(SnitchDesk.NotOpen.selector, later));
+        desk.onOracleResult(laterId, b, sigB);
+    }
+
+    /// @dev The duplicate-id guard reverts the whole opening: no case number is spent, no fee or
+    /// price leaves the opener, and the first case keeps its binding.
+    function test_duplicateRequestIdRevertsTheWholeOpening() public {
+        uint256 first = open(alice, 0);
+        intake.setCount(0);
+        uint256 cases = desk.caseCount();
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(SnitchDesk.DuplicateRequestId.selector, requestOf(first)));
+        desk.openCase(1, address(pepe), wallet, 1, 2);
+        assertEq(desk.caseCount(), cases, "a refused opening spent a case number");
+        assertEq(snitch.balanceOf(bob), 10 * FEE);
+        assertEq(imd.balanceOf(bob), 10 * PRICE);
+        assertEq(desk.caseOfRequest(requestOf(first)), first);
+        assertEq(desk.getCase(first).opener, alice);
+        // the id after the collision is fresh again and the opening goes through
+        intake.setCount(1);
+        uint256 second = open(bob, 1);
+        assertEq(second, first + 1);
+        assertEq(desk.caseOfRequest(requestOf(second)), second);
     }
 
     function test_intakeWithoutCodeCannotOpenCases() public {

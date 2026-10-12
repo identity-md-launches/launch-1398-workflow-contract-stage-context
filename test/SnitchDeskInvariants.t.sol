@@ -15,9 +15,11 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockIntake} from "./mocks/MockIntake.sol";
 
 /// @dev Drives the desk through its whole life with several actors and bounded inputs: cases are
-/// opened, answered (validly and invalidly), failed, dropped and filed in random order while the
-/// owner moves the fee, the panel and the failure hook, and the clock advances. Every expected
-/// failure is caught and asserted here; an unexpected revert fails the run (fail-on-revert).
+/// opened (plain and with limits), answered (validly and invalidly), failed, dropped and filed in
+/// random order while the owner moves the fee, the panel, the failure hook and the intake between
+/// two mocks, and the clock advances. Each case is answered only by the intake it was asked at.
+/// Every expected failure is caught and asserted here; an unexpected revert fails the run
+/// (fail-on-revert).
 contract SnitchDeskHandler is CommonBase, StdUtils {
     uint256 constant SUPPLY = 10 ** 27;
     uint256 constant SIGNER_KEY = 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d;
@@ -28,6 +30,7 @@ contract SnitchDeskHandler is CommonBase, StdUtils {
     MockERC20 public imd;
     MockERC20 public pepe;
     MockIntake public intake;
+    MockIntake public otherIntake;
     SnitchDesk public desk;
     SnitchReports public reports;
 
@@ -50,6 +53,12 @@ contract SnitchDeskHandler is CommonBase, StdUtils {
     mapping(address => uint256) public ghostImdMinted;
     mapping(uint256 => SnitchTypes.Status) public recorded; // the status this handler last saw
     mapping(uint256 => bytes32) public oracleIdOf; // the oracle request id a case was answered with
+    mapping(uint256 => bool) public failedSeen; // cases this handler saw the asked intake fail
+    mapping(uint256 => bytes32) public requestIdOf; // the intake request id a case was opened with
+    mapping(uint256 => address) public intakeOf; // the intake a case was asked at
+    uint256 public ghostLimitedOpenings;
+    uint256 public ghostRefusedLimits;
+    uint256 public ghostIntakeMoves;
     uint256[] public openIds;
     uint256[] public answeredIds;
     uint256[] public filedIds;
@@ -63,10 +72,13 @@ contract SnitchDeskHandler is CommonBase, StdUtils {
         imd = new MockERC20("IdentityMD", "IMD");
         pepe = new MockERC20("Pepe", "PEPE");
         intake = new MockIntake();
+        otherIntake = new MockIntake();
+        otherIntake.setCount(1_000_000); // ids that never collide with the first intake's
         SnitchArt art = new SnitchArt();
         desk = new SnitchDesk(OWNER, address(snitch), address(imd), address(intake), vm.addr(SIGNER_KEY), address(art));
         reports = desk.reports();
         intake.setPrice(desk.DEFAULT_ACTION(), address(imd), price);
+        otherIntake.setPrice(desk.DEFAULT_ACTION(), address(imd), price);
         actors.push(makeActor("alice"));
         actors.push(makeActor("bob"));
         actors.push(makeActor("carol"));
@@ -113,10 +125,72 @@ contract SnitchDeskHandler is CommonBase, StdUtils {
         uint256 heldBefore = snitch.balanceOf(address(desk));
         vm.prank(who);
         uint256 caseId = desk.openCase(kind, address(pepe), who, fromBlock, toBlock);
+        recordOpening(caseId, who, fee, heldBefore);
+    }
 
+    /// @dev The limited opening: with limits at or above the live amounts it is the plain opening;
+    /// with either limit below, it reverts and nothing is pulled or counted.
+    function openCaseWithLimits(uint256 actorSeed, uint8 kind, uint64 fromBlock, uint64 toBlock, uint256 slack)
+        external
+    {
+        address who = actors[bound(actorSeed, 0, actors.length - 1)];
+        kind = uint8(bound(kind, 0, 1));
+        toBlock = uint64(bound(toBlock, 2, block.number));
+        fromBlock = uint64(bound(fromBlock, 1, toBlock - 1));
+        uint256 fee = desk.caseFee();
+        // slack 0..2: a short fee limit, a short price limit, or both exactly met
+        slack = bound(slack, 0, 2);
+        uint256 maxFee = slack == 0 && fee > 0 ? fee - 1 : fee;
+        uint256 maxPrice = slack == 1 ? price - 1 : price;
+        bool expected = maxFee >= fee && maxPrice >= price;
+        // a refused opening is refused before anything is pulled, so the actor is funded only when
+        // the opening is expected to land (the ghost accounting assumes actors hold no spare IMD)
+        if (expected) topUp(who, fee);
+
+        tryLimitedOpening(who, kind, fromBlock, toBlock, maxFee, maxPrice, expected);
+    }
+
+    function tryLimitedOpening(
+        address who,
+        uint8 kind,
+        uint64 fromBlock,
+        uint64 toBlock,
+        uint256 maxFee,
+        uint256 maxPrice,
+        bool expected
+    ) internal {
+        uint256 heldBefore = snitch.balanceOf(address(desk));
+        uint256 whoBefore = snitch.balanceOf(who);
+        uint256 cases = desk.caseCount();
+        vm.prank(who);
+        (bool ok, bytes memory ret) = address(desk)
+            .call(
+                abi.encodeWithSelector(
+                    desk.openCaseWithLimits.selector, kind, address(pepe), who, fromBlock, toBlock, maxFee, maxPrice
+                )
+            );
+        require(ok == expected, expected ? "limits at the live amounts were refused" : "a short limit was accepted");
+        if (!ok) {
+            require(desk.caseCount() == cases, "a refused limited opening spent a case number");
+            require(snitch.balanceOf(who) == whoBefore, "a refused limited opening pulled SNITCH");
+            require(snitch.balanceOf(address(desk)) == heldBefore, "a refused limited opening changed the held sum");
+            ++ghostRefusedLimits;
+            return;
+        }
+        recordOpening(abi.decode(ret, (uint256)), who, desk.caseFee(), heldBefore);
+        ++ghostLimitedOpenings;
+    }
+
+    function recordOpening(uint256 caseId, address who, uint256 fee, uint256 heldBefore) internal {
         require(caseId == ++ghostOpened, "case numbers are not sequential");
         require(snitch.balanceOf(address(desk)) == heldBefore + fee, "the fee was not pulled exactly");
         require(imd.balanceOf(address(desk)) == 0, "IMD left in the desk");
+        MockIntake askedAt = MockIntake(address(desk.intake()));
+        bytes32 rid = askedAt.lastRequestId();
+        require(desk.caseOfRequest(rid) == caseId, "request id not bound to the case");
+        require(desk.intakeOfRequest(rid) == address(askedAt), "case not bound to the intake it was asked at");
+        requestIdOf[caseId] = rid;
+        intakeOf[caseId] = address(askedAt);
         ghostHeld += fee;
         ghostImdPaid += price;
         ghostPaid[who] += fee;
@@ -136,7 +210,7 @@ contract SnitchDeskHandler is CommonBase, StdUtils {
         a.agreed = uint16(bound(extraAgreed, a.quorum, a.panelSize));
 
         uint256 burnedBefore = snitch.balanceOf(desk.BURN());
-        (bool ok,) = intake.complete(requestId(caseId), a, sign(SIGNER_KEY, a));
+        (bool ok,) = asked(caseId).complete(requestIdOf[caseId], a, sign(SIGNER_KEY, a));
         require(ok, "a valid answer did not land under the stipend");
 
         SnitchTypes.Case memory after_ = desk.getCase(caseId);
@@ -153,7 +227,8 @@ contract SnitchDeskHandler is CommonBase, StdUtils {
     }
 
     /// @dev An answer that must be refused: wrong key, weak panel, expired, wrong chain, wrong type,
-    /// a replayed oracle id, a tampered field, or the right answer from the wrong caller.
+    /// a replayed oracle id, a tampered field, a foreign block window, or the right answer from the
+    /// wrong caller (the opener, and the intake the case was not asked at).
     function badAnswer(uint256 caseSeed, uint8 mode) external {
         if (openIds.length == 0) return;
         uint256 caseId = openIds[bound(caseSeed, 0, openIds.length - 1)];
@@ -162,7 +237,7 @@ contract SnitchDeskHandler is CommonBase, StdUtils {
         a.panelSize = c.askedPanelSize;
         a.quorum = c.askedQuorum;
         a.agreed = c.askedPanelSize;
-        mode = uint8(bound(mode, 0, 7));
+        mode = uint8(bound(mode, 0, 8));
         uint256 key = SIGNER_KEY;
         if (mode == 0) {
             key = OTHER_KEY;
@@ -180,25 +255,19 @@ contract SnitchDeskHandler is CommonBase, StdUtils {
         } else if (mode == 6) {
             if (answeredIds.length == 0) return;
             a.requestId = oracleIdOf[answeredIds[0]];
+        } else if (mode == 8) {
+            a.toBlock = c.toBlock + 1; // signed over a window that is not the case's
         }
         bytes memory sig = sign(key, a);
         if (mode == 7) a.figure = 2; // tampered after signing
 
         uint256 heldBefore = snitch.balanceOf(address(desk));
         uint256 burnedBefore = snitch.balanceOf(desk.BURN());
-        (bool ok,) = intake.complete(requestId(caseId), a, sig);
+        (bool ok,) = asked(caseId).complete(requestIdOf[caseId], a, sig);
         require(!ok, "an invalid answer was accepted");
 
-        // and the genuine answer from anyone but the intake
-        OracleAttestation.Attestation memory good = attestationFor(caseId, c, true, 1);
-        good.panelSize = c.askedPanelSize;
-        good.quorum = c.askedQuorum;
-        good.agreed = c.askedPanelSize;
-        bytes memory goodSig = sign(SIGNER_KEY, good);
-        vm.prank(c.opener);
-        (bool okStranger,) =
-            address(desk).call(abi.encodeWithSelector(desk.onOracleResult.selector, requestId(caseId), good, goodSig));
-        require(!okStranger, "an answer from a non-intake caller was accepted");
+        // and the genuine answer from anyone but the asked intake: the opener, and the other intake
+        refuseGenuineAnswerFromWrongCallers(caseId, c);
 
         require(uint8(desk.getCase(caseId).status) == uint8(SnitchTypes.Status.Open), "a refused answer changed status");
         require(snitch.balanceOf(address(desk)) == heldBefore, "a refused answer moved held SNITCH");
@@ -206,15 +275,41 @@ contract SnitchDeskHandler is CommonBase, StdUtils {
         ++ghostRejectedAnswers;
     }
 
+    function refuseGenuineAnswerFromWrongCallers(uint256 caseId, SnitchTypes.Case memory c) internal {
+        OracleAttestation.Attestation memory good = attestationFor(caseId, c, true, 1);
+        good.panelSize = c.askedPanelSize;
+        good.quorum = c.askedQuorum;
+        good.agreed = c.askedPanelSize;
+        bytes memory call_ =
+            abi.encodeWithSelector(desk.onOracleResult.selector, requestIdOf[caseId], good, sign(SIGNER_KEY, good));
+        vm.prank(c.opener);
+        (bool okStranger,) = address(desk).call(call_);
+        require(!okStranger, "an answer from a non-intake caller was accepted");
+        address notAsked = intakeOf[caseId] == address(intake) ? address(otherIntake) : address(intake);
+        vm.prank(notAsked);
+        (bool okOther,) = address(desk).call(call_);
+        require(!okOther, "an answer from the intake the case was not asked at was accepted");
+        vm.prank(notAsked);
+        (bool okOtherFail,) = address(desk)
+            .call(
+                abi.encodeWithSelector(
+                    desk.onOracleFailure.selector, requestIdOf[caseId], 2, bytes32("disagreed"), 1, 2, ""
+                )
+            );
+        require(!okOtherFail, "a failure from the intake the case was not asked at was accepted");
+        require(!desk.failed(caseId) || failedBefore(caseId), "a refused failure notice marked the case");
+    }
+
     function fail(uint256 caseSeed) external {
         if (openIds.length == 0) return;
         uint256 caseId = openIds[bound(caseSeed, 0, openIds.length - 1)];
-        (,,,,,, bool withFailure) = intake.stored(requestId(caseId));
+        (,,,,,, bool withFailure) = asked(caseId).stored(requestIdOf[caseId]);
         if (!withFailure) return;
         uint256 heldBefore = snitch.balanceOf(address(desk));
-        bool ok = intake.fail(requestId(caseId), 2, bytes32("disagreed"), 3, 12);
+        bool ok = asked(caseId).fail(requestIdOf[caseId], 2, bytes32("disagreed"), 3, 12);
         require(ok, "failure notice refused for an open case");
         require(desk.failed(caseId), "failure not recorded");
+        failedSeen[caseId] = true;
         require(snitch.balanceOf(address(desk)) == heldBefore, "a failure moved SNITCH");
         require(uint8(desk.getCase(caseId).status) == uint8(SnitchTypes.Status.Open), "a failure closed the case");
         ++ghostFailures;
@@ -279,7 +374,7 @@ contract SnitchDeskHandler is CommonBase, StdUtils {
 
     /// @dev One entry point for the settings so the runner spends most of its calls on cases.
     function tweak(uint8 mode, uint256 a, uint256 b) external {
-        mode = uint8(bound(mode, 0, 4));
+        mode = uint8(bound(mode, 0, 5));
         if (mode == 0) {
             vm.prank(OWNER);
             desk.setCaseFee(bound(a, 0, 5 * 200_000 ether));
@@ -293,8 +388,16 @@ contract SnitchDeskHandler is CommonBase, StdUtils {
         } else if (mode == 3) {
             price = bound(a, 1, 2 ether);
             intake.setPrice(desk.DEFAULT_ACTION(), address(imd), price);
-        } else {
+            otherIntake.setPrice(desk.DEFAULT_ACTION(), address(imd), price);
+        } else if (mode == 4) {
             vm.warp(block.timestamp + bound(a, 0, 24 hours));
+        } else {
+            // the owner moves the desk to the other intake; open cases stay with the one they asked
+            address to = address(desk.intake()) == address(intake) ? address(otherIntake) : address(intake);
+            vm.prank(OWNER);
+            desk.setIntake(to);
+            require(address(desk.intake()) == to, "intake not moved");
+            ++ghostIntakeMoves;
         }
     }
 
@@ -354,8 +457,14 @@ contract SnitchDeskHandler is CommonBase, StdUtils {
         return abi.encodePacked(r, s, v);
     }
 
-    function requestId(uint256 caseId) public pure returns (bytes32) {
-        return keccak256(abi.encode("intake", caseId));
+    /// @dev The mock intake a case was asked at: the only one whose `complete` or `fail` lands.
+    function asked(uint256 caseId) internal view returns (MockIntake) {
+        return MockIntake(intakeOf[caseId]);
+    }
+
+    /// @dev Whether the case was already marked failed before the current action started.
+    function failedBefore(uint256 caseId) internal view returns (bool) {
+        return failedSeen[caseId];
     }
 
     function indexOf(address who) internal view returns (uint256) {
@@ -373,8 +482,9 @@ contract SnitchDeskHandler is CommonBase, StdUtils {
 
 /// @notice What must hold after every sequence: the desk holds exactly the fees of its open cases,
 /// the dead address holds exactly the fees of answered ones, nobody is refunded more than they paid,
-/// the IMD is all with the intake, the supply never changes, finished cases never reopen, and a
-/// report exists exactly for the filed cases, owned by the opener.
+/// the IMD is all with the intakes, the supply never changes, finished cases never reopen, every
+/// case stays bound to the intake it was asked at, and a report exists exactly for the filed cases,
+/// owned by the opener.
 /// forge-config: default.invariant.runs = 160
 /// forge-config: default.invariant.depth = 64
 /// forge-config: default.invariant.fail-on-revert = true
@@ -410,8 +520,13 @@ contract SnitchDeskInvariantTest is Test {
 
     function invariant_noImdEverRestsInTheDesk() public view {
         assertEq(imd.balanceOf(address(desk)), 0);
-        assertEq(imd.balanceOf(address(handler.intake())), handler.ghostImdPaid(), "intake holds a different IMD sum");
+        assertEq(
+            imd.balanceOf(address(handler.intake())) + imd.balanceOf(address(handler.otherIntake())),
+            handler.ghostImdPaid(),
+            "the intakes hold a different IMD sum"
+        );
         assertEq(imd.allowance(address(desk), address(handler.intake())), 0, "a dangling IMD allowance");
+        assertEq(imd.allowance(address(desk), address(handler.otherIntake())), 0, "a dangling IMD allowance");
     }
 
     function invariant_supplyIsFixedAndConserved() public view {
@@ -445,7 +560,14 @@ contract SnitchDeskInvariantTest is Test {
             SnitchTypes.Status now_ = desk.getCase(id).status;
             assertEq(uint8(now_), uint8(handler.recorded(id)), "a case changed status outside a handler action");
             assertTrue(now_ != SnitchTypes.Status.None, "an opened case has no status");
-            assertEq(desk.caseOfRequest(handler.requestId(id)), id, "request id unbound");
+            bytes32 rid = handler.requestIdOf(id);
+            assertEq(desk.caseOfRequest(rid), id, "request id unbound");
+            assertEq(desk.intakeOfRequest(rid), handler.intakeOf(id), "case moved to another intake");
+            assertTrue(
+                handler.intakeOf(id) == address(handler.intake())
+                    || handler.intakeOf(id) == address(handler.otherIntake()),
+                "asked at an unknown intake"
+            );
             if (now_ == SnitchTypes.Status.Answered || now_ == SnitchTypes.Status.Filed) {
                 assertTrue(desk.consumed(handler.oracleIdOf(id)), "answered without consuming the oracle id");
             }
@@ -486,5 +608,10 @@ contract SnitchDeskInvariantTest is Test {
         assertGe(desk.quorum(), 2);
         assertLe(desk.quorum(), desk.panelSize());
         assertEq(desk.owner(), handler.OWNER());
+        assertTrue(
+            address(desk.intake()) == address(handler.intake())
+                || address(desk.intake()) == address(handler.otherIntake()),
+            "desk points at an unknown intake"
+        );
     }
 }

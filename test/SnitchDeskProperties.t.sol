@@ -154,7 +154,8 @@ contract SnitchDeskPropertiesTest is SnitchBase {
         assertTrue(desk.consumed(a.requestId));
     }
 
-    /// @dev Flip any single field after signing and the signature no longer verifies.
+    /// @dev Flip any single field after signing and the answer is refused: a tampered block window
+    /// is caught by the window check before the signature, every other field by the signature.
     function testFuzz_anyTamperedFieldBreaksTheSignature(uint8 field, uint256 delta) public {
         field = uint8(bound(field, 0, 12));
         delta = bound(delta, 1, type(uint16).max); // non-zero, and small enough that every field width changes
@@ -164,23 +165,146 @@ contract SnitchDeskPropertiesTest is SnitchBase {
         a.quorum = 10;
         a.agreed = 15;
         bytes memory sig = sign(a);
-        if (field == 0) a.requestId = bytes32(uint256(a.requestId) ^ delta);
-        else if (field == 1) a.questionHash = bytes32(uint256(a.questionHash) ^ delta);
-        else if (field == 2) a.answer = abi.encode(false);
-        else if (field == 3) a.figure ^= delta;
-        else if (field == 4) a.fromBlock ^= uint64(delta);
-        else if (field == 5) a.toBlock ^= uint64(delta);
-        else if (field == 6) a.blockHash = bytes32(uint256(a.blockHash) ^ delta);
-        else if (field == 7) a.panelJobId = bytes32(uint256(a.panelJobId) ^ delta);
-        else if (field == 8) a.panelSize = uint16(bound(delta, 12, 100) == a.panelSize ? 21 : bound(delta, 12, 100));
-        else if (field == 9) a.quorum = a.quorum == 8 ? 9 : 8;
-        else if (field == 10) a.agreed = a.agreed == 20 ? 19 : 20;
-        else if (field == 11) a.issuedAt -= uint64(bound(delta, 1, 50));
-        else a.expiresAt += uint64(bound(delta, 1, 50));
+        bytes memory err = abi.encodeWithSelector(OracleAttestationConsumer.BadSignature.selector);
+        if (field == 0) {
+            a.requestId = bytes32(uint256(a.requestId) ^ delta);
+        } else if (field == 1) {
+            a.questionHash = bytes32(uint256(a.questionHash) ^ delta);
+        } else if (field == 2) {
+            a.answer = abi.encode(false);
+        } else if (field == 3) {
+            a.figure ^= delta;
+        } else if (field == 4) {
+            a.fromBlock ^= uint64(delta);
+            err = abi.encodeWithSelector(SnitchDesk.WrongWindow.selector, a.fromBlock, a.toBlock);
+        } else if (field == 5) {
+            a.toBlock ^= uint64(delta);
+            err = abi.encodeWithSelector(SnitchDesk.WrongWindow.selector, a.fromBlock, a.toBlock);
+        } else if (field == 6) {
+            a.blockHash = bytes32(uint256(a.blockHash) ^ delta);
+        } else if (field == 7) {
+            a.panelJobId = bytes32(uint256(a.panelJobId) ^ delta);
+        } else if (field == 8) {
+            a.panelSize = uint16(bound(delta, 12, 100) == a.panelSize ? 21 : bound(delta, 12, 100));
+        } else if (field == 9) {
+            a.quorum = a.quorum == 8 ? 9 : 8;
+        } else if (field == 10) {
+            a.agreed = a.agreed == 20 ? 19 : 20;
+        } else if (field == 11) {
+            a.issuedAt -= uint64(bound(delta, 1, 50));
+        } else {
+            a.expiresAt += uint64(bound(delta, 1, 50));
+        }
         bytes32 requestId = requestOf(caseId);
-        vm.expectRevert(OracleAttestationConsumer.BadSignature.selector);
+        vm.expectRevert(err);
         intake.completeUnbounded(requestId, a, sig);
         assertEq(uint8(desk.getCase(caseId).status), uint8(SnitchTypes.Status.Open));
+        assertEq(snitch.balanceOf(address(desk)), FEE, "a refused answer moved the fee");
+        assertFalse(desk.consumed(a.requestId));
+    }
+
+    /// @dev A correctly signed answer over any window but the case's own is refused, whatever the
+    /// signer attests; only the exact (fromBlock, toBlock) pair the case was opened with lands.
+    function testFuzz_answerWindowMustBeTheCases(uint64 fromBlock, uint64 toBlock) public {
+        uint256 caseId = open(alice, 0);
+        SnitchTypes.Case memory c = desk.getCase(caseId);
+        // keep the fuzz close to the real window so off-by-one values are hit often
+        fromBlock = uint64(bound(fromBlock, c.fromBlock - 2, c.fromBlock + 2));
+        toBlock = uint64(bound(toBlock, c.toBlock - 2, c.toBlock + 2));
+        OracleAttestation.Attestation memory a = attestationFor(caseId, true, 0);
+        a.fromBlock = fromBlock;
+        a.toBlock = toBlock;
+        bool expected = fromBlock == c.fromBlock && toBlock == c.toBlock;
+        bytes memory sig = sign(a);
+        bytes32 requestId = requestOf(caseId);
+        if (!expected) {
+            vm.expectRevert(abi.encodeWithSelector(SnitchDesk.WrongWindow.selector, fromBlock, toBlock));
+            intake.completeUnbounded(requestId, a, sig);
+            assertEq(uint8(desk.getCase(caseId).status), uint8(SnitchTypes.Status.Open));
+            assertEq(snitch.balanceOf(desk.BURN()), 0);
+        } else {
+            (bool ok,) = intake.complete(requestId, a, sig);
+            assertTrue(ok, "the case's own window was refused");
+            assertEq(uint8(desk.getCase(caseId).status), uint8(SnitchTypes.Status.Answered));
+        }
+    }
+
+    // ---- openCaseWithLimits ----
+
+    /// @dev The limited opening is accepted exactly when both limits cover the live fee and price,
+    /// and a refused opening pulls nothing and spends no case number. The fee limit is checked
+    /// first, so its error is the one a wallet sees when both are too low.
+    function testFuzz_limitsAcceptedIffBothCoverTheLiveAmounts(
+        uint256 fee,
+        uint256 price,
+        uint256 maxFee,
+        uint256 maxOraclePrice
+    ) public {
+        fee = bound(fee, 0, snitch.balanceOf(alice));
+        price = bound(price, 1, imd.balanceOf(alice));
+        maxFee = bound(maxFee, 0, 2 * fee + 1);
+        maxOraclePrice = bound(maxOraclePrice, 0, 2 * price);
+        vm.prank(OWNER);
+        desk.setCaseFee(fee);
+        intake.setPrice(desk.DEFAULT_ACTION(), address(imd), price);
+        uint256 snitchBefore = snitch.balanceOf(alice);
+        uint256 imdBefore = imd.balanceOf(alice);
+
+        vm.prank(alice);
+        (bool ok, bytes memory ret) = address(desk)
+            .call(
+                abi.encodeWithSelector(
+                    desk.openCaseWithLimits.selector,
+                    uint8(1),
+                    address(pepe),
+                    wallet,
+                    uint64(1),
+                    uint64(2),
+                    maxFee,
+                    maxOraclePrice
+                )
+            );
+        bool expected = maxFee >= fee && maxOraclePrice >= price;
+        assertEq(ok, expected, "limit decision");
+        if (ok) {
+            assertEq(desk.caseCount(), 1);
+            assertEq(desk.getCase(1).fee, fee);
+            assertEq(snitch.balanceOf(alice), snitchBefore - fee);
+            assertEq(imd.balanceOf(alice), imdBefore - price);
+            assertEq(imd.balanceOf(address(intake)), price);
+        } else {
+            bytes memory err = maxFee < fee
+                ? abi.encodeWithSelector(SnitchDesk.FeeAboveLimit.selector, fee, maxFee)
+                : abi.encodeWithSelector(SnitchDesk.PriceAboveLimit.selector, price, maxOraclePrice);
+            assertEq(ret, err, "wrong limit error");
+            assertEq(desk.caseCount(), 0, "a refused opening spent a case number");
+            assertEq(snitch.balanceOf(alice), snitchBefore, "a refused opening pulled SNITCH");
+            assertEq(imd.balanceOf(alice), imdBefore, "a refused opening pulled IMD");
+            assertEq(imd.balanceOf(address(intake)), 0);
+        }
+    }
+
+    /// @dev The limited opening validates the case exactly as the plain one does, after the limits.
+    function testFuzz_limitedOpeningKeepsTheSameInputRules(uint8 kind, uint64 fromBlock, uint64 toBlock) public {
+        toBlock = uint64(bound(toBlock, 0, block.number + 5));
+        fromBlock = uint64(bound(fromBlock, 0, block.number + 5));
+        bool expected = kind <= 1 && fromBlock < toBlock && toBlock <= block.number;
+        vm.prank(alice);
+        (bool ok,) = address(desk)
+            .call(
+                abi.encodeWithSelector(
+                    desk.openCaseWithLimits.selector, kind, address(pepe), wallet, fromBlock, toBlock, FEE, PRICE
+                )
+            );
+        assertEq(ok, expected, "input decision");
+        assertEq(desk.caseCount(), ok ? 1 : 0);
+        if (ok) {
+            SnitchTypes.Case memory c = desk.getCase(1);
+            assertEq(c.kind, kind);
+            assertEq(c.fromBlock, fromBlock);
+            assertEq(c.toBlock, toBlock);
+            assertEq(desk.intakeOfRequest(requestOf(1)), address(intake));
+        }
     }
 
     // ---- who may call ----
