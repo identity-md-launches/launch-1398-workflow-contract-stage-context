@@ -1,0 +1,33 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "Snitch",
+    "symbol": "SNITCH",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "SnitchArt",
+      "constructorArgs": []
+    },
+    {
+      "contract": "SnitchDesk",
+      "constructorArgs": [
+        "$owner",
+        "$token",
+        "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+        "0xa43e6f75ee006411f79ac1c84120606c2330de82",
+        "0x5598aa9146215bc13eb26f2c692ad1461fd32982",
+        "$contract:SnitchArt"
+      ]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "SNITCH: anyone opens a case on a wallet (kind 0 never sold, kind 1 got in early), the IMD oracle panel answers on chain, and the case is filed as a report NFT stamped CLEAN or SNITCHED. LaunchToken is the fixed-supply SNITCH ERC-20 with no constructor arguments; the factory splits its supply. SnitchArt is a stateless renderer with no constructor arguments and no owner; it is deployed first because the desk takes its address. SnitchDesk(owner_, snitch_, imd_, intake_, oracleSigner_, art_): owner_ is $owner, the launch owner (Ownable2Step, renounce disabled; it can set the case fee, intake, action id, oracle signer, panel and failure hook for future cases, and nothing else: no pause, no upgrade, no way to move held SNITCH except the burn on an answer and the refund on a drop). snitch_ is $token, the case fee currency (200,000 SNITCH per case, held then sent to 0x000000000000000000000000000000000000dEaD on a valid answer, refunded on dropCase after 72 hours unanswered). imd_ is IMD on Ethereum, 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7, what the oracle is paid in (the intake's live price, 0.5 IMD at writing, pulled at openCase and forwarded in the same transaction). intake_ is the IMD Intake version 2 on Ethereum, 0xa43e6f75ee006411f79ac1c84120606c2330de82, the address the accepted implementation and its deployment test fix; the approved workflow text names the version 1 intake 0x1397434cd35e8a9c8ac312a61d3a285eb31dea56, and the builders chose version 2 because it carries requestWithFailure in addition to everything version 1 has. Both have code on mainnet and quote the same oracle price; the desk calls plain request until the owner turns the failure hook on, and the owner can move the intake with setIntake. oracleSigner_ is the oracle attester published by api.imd.fun, 0x5598aa9146215bc13eb26f2c692ad1461fd32982, as the accepted implementation records it; it is an externally owned account on mainnet and the owner rotates it with setOracleSigner. art_ is $contract:SnitchArt. SnitchReports, the ERC-721 Snitch Reports (REPORT), is not a manifest entry: SnitchDesk deploys it in its own constructor with new SnitchReports(address(this), art) so only the desk can mint; read its address from SnitchDesk.reports(). No constructor calls another contract, so the constructors run on the empty launch chain; nothing is minted, allocated or sent to any project contract at launch, and the desk only holds SNITCH that case openers deposit after launch. The pool values are the launch's own: SNITCH paired with IMD, fee 12500, tick spacing 60, the stated initial price; the deployer derives the opening price from the policy's opening market cap."
+}
