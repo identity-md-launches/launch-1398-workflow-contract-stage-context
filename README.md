@@ -57,8 +57,8 @@ Values fixed in the desk at construction, changeable by the owner afterwards:
 | --- | --- | --- |
 | Case fee | 200,000 SNITCH | `setCaseFee(uint256)` (at most 2^128 - 1) |
 | Oracle action | `bytes32("oracle.request@oracle-1")` | `setAction(bytes32)` |
-| Intake | constructor argument | `setIntake(address)` |
-| Oracle signer | constructor argument | `setOracleSigner(address)` |
+| Intake | constructor argument | `setIntake(address)`; binds cases opened afterwards, an open case stays with the intake it was asked at |
+| Oracle signer | constructor argument | `setOracleSigner(address)`; checked when an answer lands, so see "After launch" step 4 |
 | Panel size / quorum asked per case | 12 / 8 | `setPanel(uint16,uint16)`, 2 ≤ quorum ≤ size ≤ 100 |
 | Failure hook (`requestWithFailure`) | off | `setFailureHook(bool)`, version 2 intake only |
 
@@ -82,9 +82,21 @@ default. The owner should still do these, in order:
    value; each case snapshots the values in force when it is opened and refuses a smaller panel.
 4. **Rotate the signer** with `setOracleSigner(address)` whenever api.imd.fun publishes a new
    attester, or point it at the signer registry (ERC-1271 is supported by `SignatureChecker`).
+   An answer is checked against the signer in force when it lands, not when the case was opened,
+   so a bare-key rotation while cases are open rejects answers the old key signed (`BadSignature`;
+   the opener gets the SNITCH back through `dropCase` after 72 hours, the IMD is spent). During a
+   handover point the desk at an ERC-1271 contract that accepts both keys, or rotate when no case
+   is open (every `CaseOpened` has a matching `CaseAnswered`, `CaseFailed` or `CaseDropped`).
 5. **Move the intake or the action** with `setIntake` / `setAction` when the plane publishes a new
-   version or price. The price is never stored: the desk reads `priceOf(action, IMD)` live at each
-   opening, so a price move needs no action.
+   version or price. Both bind cases opened from then on: each request records the intake it was
+   asked at (`intakeOfRequest(requestId)`), and only that intake can answer or fail it, so moving
+   the desk strands nothing. The price is never stored: the desk reads `priceOf(action, IMD)` live
+   at each opening, so a price move needs no action.
+6. **Check the first answers' `questionHash`.** The desk cannot recompute the plane's canonical
+   question document on chain; it binds each answer to its case by the intake request id, the
+   asking intake and the signed block window. For the first live cases of each kind, compare the
+   `questionHash` emitted in `CaseAnswered` against `oracleQuestionHash(body)` from the protocol
+   package to confirm the plane answered the body the desk sent.
 
 ## How a case runs
 
@@ -93,18 +105,22 @@ default. The owner should still do these, in order:
    SNITCH (held by the desk) and the oracle price in IMD (forwarded to the intake in the same
    transaction, after a `forceApprove` of exactly that amount). Snapshots the token's symbol with
    a gas-capped, return-size-bounded `staticcall`: 1 to 11 characters, `A-Z a-z 0-9` only,
-   otherwise the short token address (`0x6982…1933`). Case numbers start at 1. Emits `CaseOpened`
-   with the intake's request id.
+   otherwise the short token address (`0x6982…1933`). Case numbers start at 1. Records the
+   intake's request id and the intake it was asked at; a request id the desk has already seen
+   reverts (`DuplicateRequestId`). Emits `CaseOpened` with the request id. `openCase` pays the fee
+   and price in force when it is mined; `openCaseWithLimits(kind, token, wallet, fromBlock, toBlock, maxFee, maxOraclePrice)`
+   does the same but reverts (`FeeAboveLimit` / `PriceAboveLimit`) instead of paying more than
+   the opener agreed to, for wallets that hold a standing approval.
 2. The oracle panel answers minutes later. The intake calls `onOracleResult(requestId, attestation, signature)`
-   with 200,000 gas. The desk checks, in order: the caller is the intake, the request id belongs
-   to an open case, the attestation's `chainId` is this chain, the panel is at least what the case
+   with 200,000 gas. The desk checks, in order: the request id belongs to a case, the caller is
+   the intake that case was asked at, the case is open, the attestation's `chainId` is this chain,
+   its signed `fromBlock` / `toBlock` are the case's window, the panel is at least what the case
    asked for and `agreed >= quorum`, the answer type is bool, the attestation is inside its window
    and signed by the oracle signer for this contract (EIP-712 domain "IdentityMD Oracle" / "2" /
    this chain / the desk), and the oracle request id has not been consumed. Any failed check
    reverts and stores nothing. A valid answer stores verdict, figure, panelSize, agreed and
    issuedAt, emits `CaseAnswered`, and sends the held SNITCH to the dead address. A "no" is a
-   result to store, not a revert. Measured gas: about 98,000 with a zero figure, 146,000 with a
-   2^256 - 1 figure.
+   result to store, not a revert. Measured gas: see "Build and test".
 3. `fileReport(caseId)`: anyone, once per answered case, mints report `caseId` to the opener. A
    plain mint, not a safe mint, so a contract opener without `onERC721Received` still gets its
    report and no receiver hook runs inside the desk.
@@ -130,8 +146,10 @@ zero". The window is absolute, so the oracle's `fromBlock` / `toBlock` are the c
 canonical question document (and so `questionHash`) is produced by the plane; the desk does not
 recompute it. On the asking chain the binding between an answer and a case is the intake's
 request id, which only the desk's own `request` call can create, as the oracle-consumer skill
-prescribes for same-chain consumers. The signed `questionHash` is emitted in `CaseAnswered` for
-anyone who wants to check it against the plane's record.
+prescribes for same-chain consumers, plus the intake that id was asked at and the signed
+`fromBlock` / `toBlock`, which must equal the case's (an absolute window is confirmed when asked,
+so the oracle signs exactly it). The signed `questionHash` is emitted in `CaseAnswered` for anyone
+who wants to check it against the plane's record; see "After launch" step 6.
 
 ## Trust assumptions and operational responsibilities
 
@@ -146,11 +164,24 @@ anyone who wants to check it against the plane's record.
 - **Wording.** The questions are fixed in the contract. If the plane's wording screen ever refuses
   them, cases fail (status 1) until the plane or a new action version accepts them. Check the
   body with `POST /requests/check` before launch; see "After launch".
-- **The owner** (two-step `Ownable2Step`, `renounceOwnership` reverts) can change the fee for
-  future cases, the intake, action, signer, panel and failure hook. The owner cannot pause, upgrade,
-  mint, change an open case, or move held SNITCH: the only outflows are the burn on an answer and
-  the refund on a drop. A malicious owner could point the desk at a fake intake and signer and
-  thereby stamp future cases at will; this is the trust the brief places in the launch owner.
+- **The owner** (two-step `Ownable2Step`, `renounceOwnership` reverts) can change the fee,
+  intake, action, panel and failure hook for cases opened afterwards, and the signer. The owner
+  cannot pause, upgrade, mint, or move held SNITCH: the only outflows are the burn on an answer and
+  the refund on a drop. An open case is answered only by the intake it was asked at, so the owner
+  cannot stamp a case that is already open by pointing the desk at an intake they control. A
+  malicious owner could still point the desk at a fake intake and signer and stamp *future* cases
+  at will, could halt openings (an unsold action id, or the failure hook on against a version 1
+  intake), and could rotate the signer away from the oracle's key while cases are open, which
+  rejects their answers until dropped and refunded. This is the trust the launch places in its
+  owner. Scope note: the approved workflow lists only `setCaseFee` as an owner power; the
+  oracle-consumer reference, which this task says wins on protocol matters, requires the intake,
+  action, signer and panel to be owner-settable so a protocol move needs no redeploy. Narrowing
+  them (a timelock on the setters, or an allow-list of intakes and signers) is a decision for the
+  requester and is not implemented here.
+- **Opening pays the live amounts.** `openCase` pulls `caseFee()` and the intake's current price
+  when it is mined, bounded only by the opener's approvals. Approve exactly the quoted amounts, or
+  use `openCaseWithLimits` with them, so a fee or price change mined first reverts the opening
+  instead of charging more.
 - **The token being investigated** is any contract with code. Its `symbol()` is called with
   50,000 gas and at most 128 bytes of return data are read, so a reverting, gas-burning,
   bytes32-returning or return-bombing token cannot block a case or cost the opener more than the
@@ -180,16 +211,24 @@ forge fmt --check
 `cbor_metadata = false`, no `ffi`, no `fs_permissions`. OpenZeppelin Contracts 5.5.0 and forge-std
 are vendored as ordinary files under `lib/`.
 
-Test coverage (66 tests, `test/`):
+Measured gas of `onOracleResult` called from the intake, including the call itself: about 133,000
+with a zero figure and 137,000 with a 2^256 - 1 figure, under the writer's 200,000 stipend
+(`test_callbackGasStaysUnderTheStipend` asserts under 160,000; `test_callbackIsAcceptedUnderExactlyTheStipend`
+delivers with exactly 200,000).
+
+Test coverage (74 tests, `test/`):
 
 - `LaunchToken.t.sol`: supply, decimals, transfer, no mint or owner.
 - `SnitchDesk.t.sol`: construction and zero-address refusal; opening (fees pulled and forwarded,
-  body shape, input validation, allowance and balance failures, live price and fee, zero fee,
-  unsold action, numbering); symbol snapshot (clean, too long, spaces, empty, non-ASCII, markup,
-  reverting, bytes32, gas-burning, return-bombing tokens); the answer (stores and burns, "no" is
-  stored, gas under the stipend and under exactly 200,000, wrong sender, unknown request, settled
-  or dropped case, consumed oracle id, wrong key, tampered fields, wrong domain, expired, not yet
-  valid, wrong chain, wrong answer type, weak panel, per-case panel snapshot); dropping (72-hour
+  body shape, input validation, allowance and balance failures, live price and fee, limits
+  refused and accepted, duplicate request id, zero fee, unsold action, numbering); symbol
+  snapshot (clean, too long, spaces, empty, non-ASCII, markup, reverting, bytes32, gas-burning,
+  return-bombing tokens); the answer (stores and burns, "no" is stored, gas under the stipend and
+  under exactly 200,000, wrong sender, unknown request, settled or dropped case, consumed oracle
+  id, wrong key, tampered fields, wrong domain, expired, not yet valid, wrong chain, wrong block
+  window, wrong answer type, weak panel, per-case panel snapshot); the asked intake (bound at
+  opening, answers and failures land from it after `setIntake` and are refused from the new one,
+  the owner cannot stamp an open case through `setOracleSigner` + `setIntake`); dropping (72-hour
   boundary, opener only, answered case, conservation of funds); the failure hook (frees the case,
   moves nothing, sender and case checks, version 1 intake); filing (anyone, once, to the opener);
   owner setters, non-owner rejection, two-step ownership, renounce disabled, no sweep.
@@ -205,10 +244,12 @@ Test coverage (66 tests, `test/`):
   supply stays with the factory, runtimes fit EIP-170 with no `DELEGATECALL`, `CALLCODE` or
   `SELFDESTRUCT`.
 
-Static analysis: slither 0.11.6 was run on `src/` during this work. It reports no high or medium
-findings; the two low findings it leaves (`reentrancy-benign` for the request-id write after the
-intake call, and `timestamp` for the status read in the failure hook) are annotated in place with
-the reason.
+Static analysis: slither 0.11.6 was run on `src/` (`slither . --filter-paths "lib/|test/"`) on
+this revision. It reports nothing of low impact or above: four informational results
+(`assembly-usage` for the bounded `symbol()` copy, `missing-inheritance`, `too-many-digits`). The
+request-id and intake bindings written after the intake call, and the status read in the failure
+hook, carry `slither-disable-next-line` notes (`reentrancy-benign`, `timestamp`) with the reason;
+nothing the callbacks read is written after an external call.
 
 Tests passing do not constitute a security audit. The independent review step sees this source
 and the manifest together.
@@ -222,7 +263,11 @@ and the manifest together.
 
 - Cases: index `CaseOpened`, `CaseAnswered`, `CaseFailed`, `CaseDropped`, `ReportFiled` from the
   desk; `getCase(caseId)` returns the stored struct. `caseCount()` is the latest case number.
-- Opening: approve `caseFee()` SNITCH and `oraclePrice()` IMD to the desk, then `openCase`.
+- Opening: approve `caseFee()` SNITCH and `oraclePrice()` IMD to the desk, then `openCase`. If the
+  wallet already holds a larger approval, call `openCaseWithLimits` with the two quoted amounts as
+  `maxFee` and `maxOraclePrice` instead, so a change mined first reverts rather than overcharges.
+- A case's request: `caseOfRequest(requestId)` and `intakeOfRequest(requestId)` map the id in
+  `CaseOpened` to the case and to the intake whose writer will answer it.
 - Reports: `SnitchDesk.reports()` is the ERC-721; `tokenURI(caseId)` is a base64 JSON data URI
   whose `image` is a base64 SVG.
 - The pool: SNITCH pairs with IMD at the network's launch fee; nothing here describes or changes it.

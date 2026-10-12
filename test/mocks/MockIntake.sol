@@ -34,6 +34,12 @@ contract MockIntake is IIntake {
         version1 = on;
     }
 
+    /// @dev Moves the id counter, so a second mock hands out ids that do not collide with the
+    /// first (or, set backwards, ids that do).
+    function setCount(uint256 to) external {
+        count = to;
+    }
+
     function priceOf(bytes32 action, address asset) external view returns (uint256) {
         return prices[action][asset];
     }
